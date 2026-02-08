@@ -1,0 +1,17 @@
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["."]
+
+[project]
+name = "tnt-deobfuscator"
+version = "0.1.0"
+description = "Static and dynamic deobfuscator for TNT-style Mach-O x86_64/arm64 binaries"
+license = { text = "MIT" }
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["unicorn>=2.0.1"]
+
+[project.scripts]
+tnt-deobfuscator = "tnt_deobfuscator.cli:main"
+tnt_deobfuscator = "tnt_deobfuscator.cli:main"
