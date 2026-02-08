@@ -163,6 +163,19 @@ class DynamicSliceResult:
     write_min: int | None
     write_max: int | None
     emu_status: str
+    runtime_string_layer: str
+    runtime_strings_found: int
+    runtime_strings_applied: int
+    runtime_key_patches: int
+
+
+@dataclasses.dataclass(frozen=True)
+class RuntimeStringCandidate:
+    file_offset: int
+    end_offset: int
+    key: int
+    decoded: str
+    imm_patch_offset: int | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -955,6 +968,175 @@ def _locate_required_stubs(
     return mprotect_stub, dyld_stub
 
 
+def _va_to_file_offset(meta: ParsedSliceMeta, va: int) -> int | None:
+    for seg in meta.segments:
+        if seg.filesize <= 0:
+            continue
+        seg_start = seg.vmaddr
+        seg_end = seg.vmaddr + seg.filesize
+        if seg_start <= va < seg_end:
+            return seg.fileoff + (va - seg_start)
+    return None
+
+
+def _read_nul_terminated(
+    slice_blob: memoryview,
+    start: int,
+    max_len: int = 512,
+) -> tuple[bytes, int] | None:
+    if start < 0 or start >= len(slice_blob):
+        return None
+    pos = start
+    end = min(len(slice_blob), start + max_len)
+    while pos < end and slice_blob[pos] != 0:
+        pos += 1
+    if pos == start or pos >= end:
+        return None
+    return bytes(slice_blob[start:pos]), pos
+
+
+def _looks_decoded_text(data: bytes) -> bool:
+    if not data:
+        return False
+
+    printable = 0
+    alpha = 0
+    for b in data:
+        if 32 <= b <= 126:
+            printable += 1
+            if (65 <= b <= 90) or (97 <= b <= 122):
+                alpha += 1
+
+    printable_ratio = printable / len(data)
+    if printable_ratio < 0.9:
+        return False
+    if alpha < 4:
+        return False
+    return True
+
+
+def _extract_runtime_string_candidates_x86(
+    slice_blob: memoryview,
+    meta: ParsedSliceMeta,
+) -> list[RuntimeStringCandidate]:
+    candidates: dict[int, RuntimeStringCandidate] = {}
+
+    for section in meta.sections:
+        if section.size <= 0:
+            continue
+        if section.offset < 0 or section.offset + section.size > len(slice_blob):
+            continue
+        if not (section.seg_maxprot & VM_PROT_EXECUTE):
+            continue
+
+        sec_start = section.offset
+        sec_end = section.offset + section.size
+        # Pattern:
+        #   48 8D 0D xx xx xx xx    lea rcx, [rip+disp32]
+        #   0F BE|B6 04 01          movsx/movzx eax, byte ptr [rcx+rax]
+        #   83 F0 kk                xor eax, imm8
+        #   ... 88 04 11            mov byte ptr [rcx+rdx], al
+        for off in range(sec_start + 7, sec_end - 32):
+            if slice_blob[off] != 0x0F:
+                continue
+            if slice_blob[off + 1] not in (0xBE, 0xB6):
+                continue
+            if bytes(slice_blob[off + 2 : off + 6]) != b"\x04\x01\x83\xf0":
+                continue
+
+            key = slice_blob[off + 6]
+            if key == 0:
+                continue
+
+            # Keep confidence high: require the store pattern shortly after.
+            window = bytes(slice_blob[off + 7 : off + 28])
+            if b"\x88\x04\x11" not in window:
+                continue
+
+            lea_off = off - 7
+            if bytes(slice_blob[lea_off : lea_off + 3]) != b"\x48\x8D\x0D":
+                continue
+
+            disp = struct.unpack_from("<i", slice_blob, lea_off + 3)[0]
+            lea_va = section.addr + (lea_off - section.offset)
+            target_va = lea_va + 7 + disp
+            target_off = _va_to_file_offset(meta, target_va)
+            if target_off is None:
+                continue
+
+            read = _read_nul_terminated(slice_blob, target_off)
+            if read is None:
+                continue
+            raw, end_off = read
+            if len(raw) < 6:
+                continue
+
+            decoded_bytes = bytes(b ^ key for b in raw)
+            if not _looks_decoded_text(decoded_bytes):
+                continue
+
+            decoded = decoded_bytes.decode("ascii", "replace")
+            prev = candidates.get(target_off)
+            if prev is None:
+                candidates[target_off] = RuntimeStringCandidate(
+                    file_offset=target_off,
+                    end_offset=end_off,
+                    key=key,
+                    decoded=decoded,
+                    imm_patch_offset=off + 6,
+                )
+
+    return sorted(candidates.values(), key=lambda item: item.file_offset)
+
+
+def _extract_runtime_string_candidates(
+    slice_blob: memoryview,
+    meta: ParsedSliceMeta,
+    arch: str,
+) -> list[RuntimeStringCandidate]:
+    if arch != "x86_64":
+        return []
+    return _extract_runtime_string_candidates_x86(slice_blob, meta)
+
+
+def _apply_runtime_string_candidates(
+    slice_blob: memoryview,
+    candidates: list[RuntimeStringCandidate],
+) -> int:
+    applied = 0
+    for item in candidates:
+        if item.file_offset < 0 or item.end_offset > len(slice_blob) or item.end_offset <= item.file_offset:
+            continue
+        raw = bytes(slice_blob[item.file_offset : item.end_offset])
+        if not raw:
+            continue
+        decoded = bytes(b ^ item.key for b in raw)
+        if not _looks_decoded_text(decoded):
+            continue
+        slice_blob[item.file_offset : item.end_offset] = decoded
+        applied += 1
+    return applied
+
+
+def _patch_runtime_xor_keys_x86(
+    slice_blob: memoryview,
+    candidates: list[RuntimeStringCandidate],
+) -> int:
+    patched = 0
+    seen: set[int] = set()
+    for item in candidates:
+        imm_off = item.imm_patch_offset
+        if imm_off is None or imm_off in seen:
+            continue
+        seen.add(imm_off)
+        if imm_off < 0 or imm_off >= len(slice_blob):
+            continue
+        if slice_blob[imm_off] == item.key:
+            slice_blob[imm_off] = 0
+            patched += 1
+    return patched
+
+
 def _run_dynamic_emulation(
     slice_blob: memoryview,
     arch: str,
@@ -1109,6 +1291,7 @@ def _patch_slice_dynamic(
     slice_info: SliceInfo,
     timeout_ms: int,
     max_insn: int,
+    string_layer: str,
     xor_key_hint: int | None = None,
 ) -> DynamicSliceResult:
     header = _parse_macho_header_64(slice_blob)
@@ -1165,6 +1348,38 @@ def _patch_slice_dynamic(
     )
     slice_blob[:] = dumped
 
+    runtime_candidates = _extract_runtime_string_candidates(
+        slice_blob=slice_blob,
+        meta=meta,
+        arch=slice_info.arch,
+    )
+    runtime_found = len(runtime_candidates)
+    runtime_applied = 0
+    runtime_key_patches = 0
+    if runtime_found:
+        _vlog(f"{slice_info.source}: runtime string candidates found={runtime_found}")
+        if VERBOSE:
+            for item in runtime_candidates[:20]:
+                _vlog(
+                    f"{slice_info.source}: runtime string key=0x{item.key:02x} "
+                    f"off=0x{item.file_offset:x} text={item.decoded!r}"
+                )
+
+    if string_layer == "runnable":
+        runtime_applied = _apply_runtime_string_candidates(slice_blob, runtime_candidates)
+        if slice_info.arch == "x86_64":
+            runtime_key_patches = _patch_runtime_xor_keys_x86(slice_blob, runtime_candidates)
+        elif runtime_found:
+            _vlog(
+                f"{slice_info.source}: runnable string layer currently has no code-key patching for "
+                f"{slice_info.arch}; only data-side decoding applied"
+            )
+        if runtime_applied or runtime_key_patches:
+            _vlog(
+                f"{slice_info.source}: runnable string layer applied={runtime_applied} "
+                f"key_patches={runtime_key_patches}"
+            )
+
     return DynamicSliceResult(
         arch=slice_info.arch,
         source=slice_info.source,
@@ -1178,6 +1393,10 @@ def _patch_slice_dynamic(
         write_min=write_min,
         write_max=write_max,
         emu_status=emu_status,
+        runtime_string_layer=string_layer,
+        runtime_strings_found=runtime_found,
+        runtime_strings_applied=runtime_applied,
+        runtime_key_patches=runtime_key_patches,
     )
 
 
@@ -1501,6 +1720,10 @@ def _format_dynamic_result(result: DynamicSliceResult) -> str:
         f"mprotect_stub={'none' if result.mprotect_stub is None else f'0x{result.mprotect_stub:x}'} "
         f"dyld_stub={'none' if result.dyld_get_slide_stub is None else f'0x{result.dyld_get_slide_stub:x}'} "
         f"symfix={result.fixed_symbol_strings} secfix={result.fixed_section_names} "
+        f"runtime_layer={result.runtime_string_layer} "
+        f"runtime_found={result.runtime_strings_found} "
+        f"runtime_applied={result.runtime_strings_applied} "
+        f"runtime_keypatch={result.runtime_key_patches} "
         f"{write_info} emu={result.emu_status}"
     )
 
@@ -1547,6 +1770,16 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     parser.add_argument(
+        "--dynamic-string-layer",
+        choices=["none", "analysis", "runnable"],
+        default="analysis",
+        help=(
+            "dynamic mode string handling: "
+            "none=disable, analysis=extract/report runtime-decoded strings, "
+            "runnable=apply string decode and patch matching decode keys"
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="enable verbose diagnostic logs (stderr)",
@@ -1572,7 +1805,8 @@ def main(argv: list[str] | None = None) -> int:
 
     _vlog(
         f"input={in_path} output={out_path} mode={args.mode} arch={args.arch} "
-        f"timeout_ms={dynamic_timeout_ms} max_insn={dynamic_max_insn}"
+        f"timeout_ms={dynamic_timeout_ms} max_insn={dynamic_max_insn} "
+        f"dynamic_string_layer={args.dynamic_string_layer}"
     )
     if args.mode == "dynamic" and dynamic_timeout_ms == 0 and dynamic_max_insn == 0:
         print(
@@ -1655,6 +1889,7 @@ def main(argv: list[str] | None = None) -> int:
                             slice_info,
                             timeout_ms=dynamic_timeout_ms,
                             max_insn=dynamic_max_insn,
+                            string_layer=args.dynamic_string_layer,
                             xor_key_hint=prime_key,
                         )
                     )

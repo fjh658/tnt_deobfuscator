@@ -54,6 +54,8 @@ tnt-deobfuscator -i <input_binary> -o <output_binary> --arch arm64
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode static
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --emu-timeout-ms 30000 --emu-max-insn 2000000
+tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --dynamic-string-layer analysis
+tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --dynamic-string-layer runnable
 tnt-deobfuscator -i <input_binary> --verbose
 ```
 
@@ -78,6 +80,9 @@ If `-o` is omitted, output defaults to `<input>.deobf`.
 - Each `(start, size)` chunk is XOR-restored using a computed key.
 - Symbol restoration uses a safe replacement policy to avoid overwriting adjacent string slots.
 - Dynamic mode requires Unicorn: `pip install unicorn`.
+- Dynamic string layers:
+- `analysis`: extract/report runtime-decoded strings without patching file semantics.
+- `runnable`: decode string bytes and patch matching decode-key sites together.
 
 ## 📄 License
 

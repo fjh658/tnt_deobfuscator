@@ -54,6 +54,8 @@ tnt-deobfuscator -i <input_binary> -o <output_binary> --arch arm64
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode static
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic
 tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --emu-timeout-ms 30000 --emu-max-insn 2000000
+tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --dynamic-string-layer analysis
+tnt-deobfuscator -i <input_binary> -o <output_binary> --mode dynamic --dynamic-string-layer runnable
 tnt-deobfuscator -i <input_binary> --verbose
 ```
 
@@ -78,6 +80,9 @@ tnt-deobfuscator -i <input_binary> --verbose
 - 每个 `(start, size)` 区段会按计算出的 XOR key 执行恢复。
 - 符号恢复采用安全替换策略，避免覆盖相邻字符串槽位。
 - 动态模式依赖 Unicorn：`pip install unicorn`。
+- 动态字符串分层：
+- `analysis`：只提取/报告运行时解码字符串，不改文件语义。
+- `runnable`：同时解码字符串字节并联动修复对应解码 key 位点。
 
 ## 📄 许可证
 
