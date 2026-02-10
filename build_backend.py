@@ -8,11 +8,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import os
 import re
-import sys
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
+
+from tnt_deobfuscator.installer import install_ida_plugin as _runtime_install_ida_plugin
 
 try:
     import tomllib
@@ -107,8 +107,6 @@ SCRIPT_ENTRIES = PROJECT["scripts"]
 
 PACKAGE_DIR = PROJECT_ROOT / "tnt_deobfuscator"
 TOP_LEVEL = "tnt_deobfuscator"
-IDA_PLUGIN_SOURCE = PACKAGE_DIR / "ida_plugin.py"
-IDA_PLUGIN_FILENAME = "tnt_deobfuscator_ida.py"
 LICENSE_SOURCE = PROJECT_ROOT / "LICENSE"
 
 
@@ -162,51 +160,8 @@ def _iter_package_files() -> list[Path]:
     )
 
 
-def _candidate_ida_plugin_dirs() -> list[Path]:
-    forced = os.environ.get("TNT_IDA_PLUGIN_DIR")
-    if forced:
-        return [Path(forced).expanduser()]
-
-    home = Path.home()
-    candidates: list[Path] = []
-    if sys.platform.startswith("darwin") or sys.platform.startswith("linux"):
-        candidates.append(home / ".idapro" / "plugins")
-    elif os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidates.append(Path(appdata) / "Hex-Rays" / "IDA Pro" / "plugins")
-            candidates.append(Path(appdata) / "IDA Pro" / "plugins")
-        candidates.append(home / ".idapro" / "plugins")
-    else:
-        candidates.append(home / ".idapro" / "plugins")
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for item in candidates:
-        key = str(item)
-        if key not in seen:
-            seen.add(key)
-            unique.append(item)
-    return unique
-
-
 def _install_ida_plugin_if_possible() -> None:
-    if os.environ.get("TNT_DEOBF_SKIP_IDA_PLUGIN_INSTALL") == "1":
-        return
-    if not IDA_PLUGIN_SOURCE.is_file():
-        return
-
-    plugin_data = IDA_PLUGIN_SOURCE.read_bytes()
-    for plugin_dir in _candidate_ida_plugin_dirs():
-        try:
-            plugin_dir.mkdir(parents=True, exist_ok=True)
-            dst = plugin_dir / IDA_PLUGIN_FILENAME
-            if dst.is_file() and dst.read_bytes() == plugin_data:
-                continue
-            dst.write_bytes(plugin_data)
-            print(f"[tnt-deobfuscator] installed IDA plugin: {dst}")
-        except OSError as exc:
-            print(f"[tnt-deobfuscator] warning: failed to install IDA plugin to {plugin_dir}: {exc}")
+    _runtime_install_ida_plugin(source=PACKAGE_DIR / "ida_plugin.py")
 
 
 def _build_wheel_file(wheel_directory: str) -> str:

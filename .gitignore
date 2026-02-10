@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+
+# Packaging / build artifacts
+build/
+dist/
+*.whl
+
+# IDA database artifacts
+*.i64
+*.idb
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# Deobfuscation outputs
+*.deobf
+*.deobf.*
+
+# Local logs/temp
+*.log
+*.tmp
+
+# Local analysis workspace artifacts (repo-root only)
+*.dylib
