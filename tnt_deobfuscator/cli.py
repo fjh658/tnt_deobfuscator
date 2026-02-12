@@ -2154,11 +2154,17 @@ def _run_dynamic_emulation(
     heap_cursor = HEAP_ADDRESS
     heap_end = HEAP_ADDRESS + HEAP_SIZE
     arm64_thread_return_sentinel: int | None = None
-    arm64_thread_stack_ptr: int | None = None
+    arm64_thread_stack_top: int | None = None
+    arm64_thread_stack_floor: int | None = None
+    arm64_thread_stack_slot_size = 0
     if arch == "arm64":
         uc.mem_map(HEAP_ADDRESS, HEAP_SIZE)
         uc.mem_map(STACK_ADDRESS_ARM64_THREAD, STACK_SIZE)
-        arm64_thread_stack_ptr = STACK_ADDRESS_ARM64_THREAD + STACK_SIZE - PAGE_SIZE
+        arm64_thread_stack_top = STACK_ADDRESS_ARM64_THREAD + STACK_SIZE - PAGE_SIZE
+        arm64_thread_stack_floor = STACK_ADDRESS_ARM64_THREAD + PAGE_SIZE
+        # Synchronous pthread_create emulation may nest; allocate one dedicated
+        # stack window per depth instead of reusing a single SP.
+        arm64_thread_stack_slot_size = 0x40000
         arm64_thread_return_sentinel = THREAD_TRAMPOLINE_ADDRESS
         uc.mem_map(arm64_thread_return_sentinel, PAGE_SIZE)
         # RET (for safety); hook_code intercepts this address before execution.
@@ -2172,7 +2178,11 @@ def _run_dynamic_emulation(
     elif arch == "arm64":
         uc.reg_write(UC_ARM64_REG_SP, stack_ptr)
         uc.reg_write(UC_ARM64_REG_X29, stack_ptr)
-        uc.reg_write(UC_ARM64_REG_X30, CODE_ADDRESS + code_size)
+        if arm64_thread_return_sentinel is not None:
+            uc.reg_write(UC_ARM64_REG_X30, arm64_thread_return_sentinel)
+        else:
+            # Fallback should still stay inside mapped code range.
+            uc.reg_write(UC_ARM64_REG_X30, CODE_ADDRESS + load_method)
     else:
         raise DeobfuscationError(f"dynamic mode unsupported arch: {arch}")
 
@@ -2414,14 +2424,14 @@ def _run_dynamic_emulation(
 
     def _arm64_force_return(retval: int, current_pc: int) -> None:
         lr = uc.reg_read(UC_ARM64_REG_X30)
-        if not (CODE_ADDRESS <= lr <= CODE_ADDRESS + code_size):
+        if not (CODE_ADDRESS <= lr < CODE_ADDRESS + code_size):
             lr = current_pc + 4
         uc.reg_write(UC_ARM64_REG_X0, retval)
         uc.reg_write(UC_ARM64_REG_PC, lr)
 
     def _arm64_return_preserve_x0(current_pc: int) -> None:
         lr = uc.reg_read(UC_ARM64_REG_X30)
-        if not (CODE_ADDRESS <= lr <= CODE_ADDRESS + code_size):
+        if not (CODE_ADDRESS <= lr < CODE_ADDRESS + code_size):
             lr = current_pc + 4
         uc.reg_write(UC_ARM64_REG_PC, lr)
 
@@ -2439,6 +2449,20 @@ def _run_dynamic_emulation(
         ptr = heap_cursor
         heap_cursor += wanted
         return ptr
+
+    def _arm64_thread_sp_for_depth(depth: int) -> int | None:
+        if (
+            arm64_thread_stack_top is None
+            or arm64_thread_stack_floor is None
+            or arm64_thread_stack_slot_size <= 0
+        ):
+            return None
+        if depth <= 0:
+            depth = 1
+        sp = arm64_thread_stack_top - (depth - 1) * arm64_thread_stack_slot_size
+        if sp <= arm64_thread_stack_floor:
+            return None
+        return sp
 
     def _arm64_bzero(ptr: int, size: int) -> None:
         if ptr <= 0:
@@ -2673,7 +2697,8 @@ def _run_dynamic_emulation(
             ):
                 if _arm64_resume_parent_from_thread():
                     return
-                _arm64_force_return(0, address)
+                _vlog("dynamic: arm64 thread sentinel hit without parent frame; stopping emulation")
+                uc.emu_stop()
                 return
 
             stub_name = stub_name_by_addr.get(address - CODE_ADDRESS)
@@ -2765,9 +2790,10 @@ def _run_dynamic_emulation(
                     thread_ptr = uc.reg_read(UC_ARM64_REG_X0)
                     start_routine = uc.reg_read(UC_ARM64_REG_X2)
                     start_arg = uc.reg_read(UC_ARM64_REG_X3)
+                    next_thread_sp = _arm64_thread_sp_for_depth(len(arm64_thread_frames) + 1)
                     if (
                         arm64_thread_return_sentinel is not None
-                        and arm64_thread_stack_ptr is not None
+                        and next_thread_sp is not None
                         and CODE_ADDRESS <= start_routine < CODE_ADDRESS + code_size
                         and len(arm64_thread_frames) < 32
                     ):
@@ -2793,8 +2819,8 @@ def _run_dynamic_emulation(
                                 )
                             except Exception:
                                 pass
-                        uc.reg_write(UC_ARM64_REG_SP, arm64_thread_stack_ptr)
-                        uc.reg_write(UC_ARM64_REG_X29, arm64_thread_stack_ptr)
+                        uc.reg_write(UC_ARM64_REG_SP, next_thread_sp)
+                        uc.reg_write(UC_ARM64_REG_X29, next_thread_sp)
                         uc.reg_write(UC_ARM64_REG_X0, start_arg)
                         uc.reg_write(UC_ARM64_REG_X1, 0)
                         uc.reg_write(UC_ARM64_REG_X2, 0)
@@ -2802,6 +2828,15 @@ def _run_dynamic_emulation(
                         uc.reg_write(UC_ARM64_REG_X30, arm64_thread_return_sentinel)
                         uc.reg_write(UC_ARM64_REG_PC, start_routine)
                         return
+                    if (
+                        VERBOSE
+                        and arm64_thread_return_sentinel is not None
+                        and next_thread_sp is None
+                    ):
+                        _vlog(
+                            "dynamic: arm64 pthread_create skipped (thread stack slots exhausted); "
+                            "falling back to stub return"
+                        )
                     _arm64_force_return(0, address)
                     return
                 if stub_name in {"_snprintf", "_pthread_setspecific", "_usleep"}:
